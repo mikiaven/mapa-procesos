@@ -72,6 +72,13 @@ async function initDatabase() {
       FOREIGN KEY (proceso_id) REFERENCES procesos(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 
+    await query(`CREATE OR REPLACE VIEW v_stats AS
+    SELECT 
+      COUNT(*) AS total_procesos,
+      SUM(CASE WHEN estado = 'Activo' THEN 1 ELSE 0 END) AS activos,
+      AVG(madurez) AS madurez_promedio
+    FROM procesos`)
+
     console.log('✅ Database schema ready')
   } catch (err) {
     console.error('❌ DB init error:', err.message)
