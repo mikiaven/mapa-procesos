@@ -1,0 +1,149 @@
+{
+  "name": "Excel OneDrive → MySQL Procesos",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 6 }]
+        }
+      },
+      "id": "node-schedule",
+      "name": "⏰ Cada 6 horas",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.microsoft.com/v1.0/me/drive/root:/{{ $vars.ONEDRIVE_FILE_PATH }}:/content",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOAuth2Api",
+        "options": {
+          "response": { "response": { "responseFormat": "file" } }
+        }
+      },
+      "id": "node-onedrive",
+      "name": "📥 Descargar Excel de OneDrive",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "notes": "Requiere credencial OAuth2 de Microsoft 365. Configura ONEDRIVE_FILE_PATH como variable (ej: Procesos/Tabla_Maestra_Procesos.xlsx)"
+    },
+    {
+      "parameters": {
+        "operation": "fromFile",
+        "binaryPropertyName": "data",
+        "options": {
+          "sheetName": "TABLA MAESTRA",
+          "range": "A4:BH200",
+          "headerRow": true,
+          "rawData": false
+        }
+      },
+      "id": "node-read-excel",
+      "name": "📊 Leer hoja TABLA MAESTRA",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Mapeo de columnas del Excel a campos de la BD ────────────────────────────\n// Ajusta los nombres de columna si difieren en tu Excel\nconst items = $input.all();\nconst procesos = [];\nconst kpis = [];\n\nfor (const item of items) {\n  const row = item.json;\n\n  // Saltar filas vacías o de ejemplo\n  const codigo = (row['Código'] || row['codigo'] || '').toString().trim();\n  if (!codigo || codigo.startsWith('[') || codigo === 'Código') continue;\n\n  // ── Mapear tipo ────────────────────────────────────────────────────────────\n  const tipoRaw = (row['Tipo de Proceso'] || row['tipo'] || '').trim();\n  const tipo = tipoRaw.includes('Estrat') ? 'Estratégico'\n             : tipoRaw.includes('Operac') ? 'Operacional'\n             : 'Complementario';\n\n  // ── Mapear costo ───────────────────────────────────────────────────────────\n  const parseCosto = (v) => {\n    if (!v) return 0;\n    const n = parseInt(String(v).replace(/[^0-9]/g, ''));\n    return isNaN(n) ? 0 : n;\n  };\n\n  // ── Mapear fecha ───────────────────────────────────────────────────────────\n  const parseDate = (v) => {\n    if (!v) return null;\n    const s = String(v).trim();\n    if (!s || s.startsWith('[')) return null;\n    // Intentar varios formatos\n    const parts = s.split(/[/\\-.]/)\n    if (parts.length === 3) {\n      // DD/MM/YYYY\n      const [d, m, y] = parts;\n      const date = new Date(`${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`);\n      if (!isNaN(date)) return date.toISOString().split('T')[0];\n    }\n    const date = new Date(v);\n    if (!isNaN(date)) return date.toISOString().split('T')[0];\n    return null;\n  };\n\n  // ── Parsear sucesores (columna puede ser 'PO-01, PO-02' o JSON) ───────────\n  const parseSucesores = (v) => {\n    if (!v) return JSON.stringify([]);\n    const s = String(v).trim();\n    try { JSON.parse(s); return s; } catch {}\n    // Viene como 'PO-01, PO-02, PC-03'\n    const arr = s.split(',').map(x => x.trim()).filter(Boolean);\n    return JSON.stringify(arr);\n  };\n\n  // ── Normalizar aprobación ────────────────────────────────────────────────\n  const aprobRaw = (row['Estado de Aprobación'] || row['aprobacion'] || '').trim();\n  const aprobMap = {\n    'aprobado': 'Aprobado',\n    'pendiente de aprobar': 'Pendiente de Aprobar',\n    'borrador': 'Borrador',\n  };\n  const aprobacion = aprobMap[aprobRaw.toLowerCase()] || 'Borrador';\n\n  // ── Construir objeto proceso ──────────────────────────────────────────────\n  const proceso = {\n    id:                codigo,\n    nombre:            (row['Nombre del Proceso'] || row['nombre'] || '').trim(),\n    macroproceso:      (row['Macroproceso'] || row['macroproceso'] || '').trim(),\n    tipo,\n    descripcion:       (row['Descripción / Propósito'] || row['descripcion'] || '').trim(),\n    funcion_arq:       (row['Función en la Arquitectura'] || row['funcion_arq'] || '').trim(),\n    owner:             (row['Process Owner'] || row['owner'] || '').trim(),\n    area:              (row['Área / Departamento'] || row['area'] || '').trim(),\n    equipo:            (row['Equipo Involucrado'] || row['equipo'] || '').trim(),\n    entradas:          (row['Entradas (Inputs)'] || row['entradas'] || '').trim(),\n    salidas:           (row['Salidas (Outputs)'] || row['salidas'] || '').trim(),\n    proveedores:       (row['Proveedores del Proceso'] || row['proveedores'] || '').trim(),\n    clientes:          (row['Clientes del Proceso'] || row['clientes'] || '').trim(),\n    predecesores:      (row['Procesos Predecesores'] || row['pred'] || '').trim(),\n    sucesores:         parseSucesores(row['Procesos Sucesores'] || row['suc'] || ''),\n    n_alimenta:        parseInt(row['N° Procesos que Alimenta'] || row['n_alimenta'] || 0) || 0,\n    criticidad:        parseInt(row['Criticidad (1-5)'] || row['criticidad'] || 1) || 1,\n    nivel_riesgo:      (row['Nivel de Riesgo'] || row['nivel_riesgo'] || 'BAJO').trim(),\n    impacto_fallo:     (row['Impacto si Falla'] || row['impacto_fallo'] || '').trim(),\n    procesos_bloq:     (row['Procesos Bloqueados'] || row['proc_bloq'] || '').trim(),\n    tipo_costo:        (row['Tipo de Costo de Fallo'] || row['tipo_costo'] || '').trim(),\n    costo_min:         parseCosto(row['Costo Mín. Estimado ($)'] || row['costo_min']),\n    costo_max:         parseCosto(row['Costo Máx. Estimado ($)'] || row['costo_max']),\n    probabilidad:      (row['Probabilidad de Fallo'] || row['probabilidad'] || 'Baja').trim(),\n    prioridad:         parseInt(row['Prioridad de Atención'] || row['prioridad'] || 3) || 3,\n    accion_prev:       (row['Acción Preventiva'] || row['accion_prev'] || '').trim(),\n    estado:            (row['Estado del Proceso'] || row['estado'] || 'Activo').trim(),\n    aprobacion,\n    aprobador:         (row['Responsable de Firma'] || row['aprobador'] || '').trim(),\n    fecha_aprobacion:  parseDate(row['Fecha de Aprobación'] || row['fecha_aprobacion']),\n    version_aprobada:  (row['N° Versión Aprobada'] || row['version_aprobada'] || '').trim(),\n    madurez:           parseInt(row['Nivel de Madurez (1-5)'] || row['madurez'] || 1) || 1,\n    frecuencia:        (row['Frecuencia de Ejecución'] || row['frecuencia'] || '').trim(),\n    normativa:         (row['Normativa / Estándar'] || row['normativa'] || '').trim(),\n    herramientas:      (row['Herramientas / Sistemas'] || row['herramientas'] || '').trim(),\n    link_procedimiento:(row['🔗 Enlace al Procedimiento'] || row['link_proc'] || '').trim(),\n    link_flujograma:   (row['🔗 Enlace al Flujograma'] || row['link_flujo'] || '').trim(),\n    version_doc:       (row['Versión del Doc.'] || row['version'] || '').trim(),\n    fecha_revision:    parseDate(row['Fecha Última Revisión'] || row['fecha_rev']),\n    fecha_prox_rev:    parseDate(row['Fecha Próxima Revisión'] || row['fecha_prox']),\n    resp_revision:     (row['Responsable de Revisión'] || row['resp_rev'] || '').trim(),\n    mejoras:           (row['Acciones de Mejora'] || row['mejoras'] || '').trim(),\n    fecha_mejora:      parseDate(row['Fecha Compromiso Mejora'] || row['fecha_mejora']),\n    estado_mejora:     (row['Estado de Mejora'] || row['estado_mejora'] || '').trim(),\n    observaciones:     (row['Observaciones'] || row['observaciones'] || '').trim(),\n  };\n\n  procesos.push(proceso);\n\n  // ── KPIs (hasta 3 por proceso) ─────────────────────────────────────────────\n  const kpiDefs = [\n    { n: row['KPI 1 – Nombre']||row['kpi1_nom'], m: row['KPI 1 – Meta']||row['kpi1_meta'], a: row['KPI 1 – Valor Actual']||row['kpi1_actual'], s: row['KPI 1 – Semáforo']||row['kpi1_semaforo'], f: row['KPI 1 – Frecuencia Med.']||row['kpi1_frec'] },\n    { n: row['KPI 2 – Nombre']||row['kpi2_nom'], m: row['KPI 2 – Meta']||row['kpi2_meta'], a: row['KPI 2 – Valor Actual']||row['kpi2_actual'], s: row['KPI 2 – Semáforo']||row['kpi2_semaforo'], f: row['KPI 2 – Frecuencia Med.']||row['kpi2_frec'] },\n    { n: row['KPI 3 – Nombre']||row['kpi3_nom'], m: row['KPI 3 – Meta']||row['kpi3_meta'], a: row['KPI 3 – Valor Actual']||row['kpi3_actual'], s: row['KPI 3 – Semáforo']||row['kpi3_semaforo'], f: row['KPI 3 – Frecuencia Med.']||row['kpi3_frec'] },\n  ];\n\n  kpiDefs.forEach((k, idx) => {\n    if (!k.n || !String(k.n).trim()) return;\n    const semaforoRaw = String(k.s || '').toLowerCase();\n    const semaforo = semaforoRaw.includes('🔴') || semaforoRaw.includes('crít') || semaforoRaw === 'red' ? 'red'\n                   : semaforoRaw.includes('🟡') || semaforoRaw.includes('alert') || semaforoRaw === 'yellow' ? 'yellow'\n                   : 'green';\n    kpis.push({\n      proceso_id:    codigo,\n      orden:         idx + 1,\n      nombre:        String(k.n).trim(),\n      meta:          String(k.m || '').trim(),\n      actual:        String(k.a || '').trim(),\n      semaforo,\n      frecuencia_med:String(k.f || '').trim(),\n    });\n  });\n}\n\n// Pasar todo junto en una variable global para los siguientes nodos\n$execution.customData.set('procesos', JSON.stringify(procesos));\n$execution.customData.set('kpis', JSON.stringify(kpis));\n\nconsole.log(`✅ Procesados: ${procesos.length} procesos, ${kpis.length} KPIs`);\n\n// Retornar los procesos para el siguiente nodo\nreturn procesos.map(p => ({ json: p }));"
+      },
+      "id": "node-transform",
+      "name": "🔄 Transformar datos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO procesos (id, nombre, macroproceso, tipo, descripcion, funcion_arq, owner, area, equipo, entradas, salidas, proveedores, clientes, predecesores, sucesores, n_alimenta, criticidad, nivel_riesgo, impacto_fallo, procesos_bloq, tipo_costo, costo_min, costo_max, probabilidad, prioridad, accion_prev, estado, aprobacion, aprobador, fecha_aprobacion, version_aprobada, madurez, frecuencia, normativa, herramientas, link_procedimiento, link_flujograma, version_doc, fecha_revision, fecha_prox_rev, resp_revision, mejoras, fecha_mejora, estado_mejora, observaciones)\nVALUES (\n  {{ $json.id }},\n  {{ $json.nombre }},\n  {{ $json.macroproceso }},\n  {{ $json.tipo }},\n  {{ $json.descripcion }},\n  {{ $json.funcion_arq }},\n  {{ $json.owner }},\n  {{ $json.area }},\n  {{ $json.equipo }},\n  {{ $json.entradas }},\n  {{ $json.salidas }},\n  {{ $json.proveedores }},\n  {{ $json.clientes }},\n  {{ $json.predecesores }},\n  {{ $json.sucesores }},\n  {{ $json.n_alimenta }},\n  {{ $json.criticidad }},\n  {{ $json.nivel_riesgo }},\n  {{ $json.impacto_fallo }},\n  {{ $json.procesos_bloq }},\n  {{ $json.tipo_costo }},\n  {{ $json.costo_min }},\n  {{ $json.costo_max }},\n  {{ $json.probabilidad }},\n  {{ $json.prioridad }},\n  {{ $json.accion_prev }},\n  {{ $json.estado }},\n  {{ $json.aprobacion }},\n  {{ $json.aprobador }},\n  {{ $json.fecha_aprobacion }},\n  {{ $json.version_aprobada }},\n  {{ $json.madurez }},\n  {{ $json.frecuencia }},\n  {{ $json.normativa }},\n  {{ $json.herramientas }},\n  {{ $json.link_procedimiento }},\n  {{ $json.link_flujograma }},\n  {{ $json.version_doc }},\n  {{ $json.fecha_revision }},\n  {{ $json.fecha_prox_rev }},\n  {{ $json.resp_revision }},\n  {{ $json.mejoras }},\n  {{ $json.fecha_mejora }},\n  {{ $json.estado_mejora }},\n  {{ $json.observaciones }}\n)\nON DUPLICATE KEY UPDATE\n  nombre            = VALUES(nombre),\n  macroproceso      = VALUES(macroproceso),\n  tipo              = VALUES(tipo),\n  descripcion       = VALUES(descripcion),\n  funcion_arq       = VALUES(funcion_arq),\n  owner             = VALUES(owner),\n  area              = VALUES(area),\n  equipo            = VALUES(equipo),\n  entradas          = VALUES(entradas),\n  salidas           = VALUES(salidas),\n  proveedores       = VALUES(proveedores),\n  clientes          = VALUES(clientes),\n  predecesores      = VALUES(predecesores),\n  sucesores         = VALUES(sucesores),\n  n_alimenta        = VALUES(n_alimenta),\n  criticidad        = VALUES(criticidad),\n  nivel_riesgo      = VALUES(nivel_riesgo),\n  impacto_fallo     = VALUES(impacto_fallo),\n  procesos_bloq     = VALUES(procesos_bloq),\n  tipo_costo        = VALUES(tipo_costo),\n  costo_min         = VALUES(costo_min),\n  costo_max         = VALUES(costo_max),\n  probabilidad      = VALUES(probabilidad),\n  prioridad         = VALUES(prioridad),\n  accion_prev       = VALUES(accion_prev),\n  estado            = VALUES(estado),\n  aprobacion        = VALUES(aprobacion),\n  aprobador         = VALUES(aprobador),\n  fecha_aprobacion  = VALUES(fecha_aprobacion),\n  version_aprobada  = VALUES(version_aprobada),\n  madurez           = VALUES(madurez),\n  frecuencia        = VALUES(frecuencia),\n  normativa         = VALUES(normativa),\n  herramientas      = VALUES(herramientas),\n  link_procedimiento= VALUES(link_procedimiento),\n  link_flujograma   = VALUES(link_flujograma),\n  version_doc       = VALUES(version_doc),\n  fecha_revision    = VALUES(fecha_revision),\n  fecha_prox_rev    = VALUES(fecha_prox_rev),\n  resp_revision     = VALUES(resp_revision),\n  mejoras           = VALUES(mejoras),\n  fecha_mejora      = VALUES(fecha_mejora),\n  estado_mejora     = VALUES(estado_mejora),\n  observaciones     = VALUES(observaciones),\n  updated_at        = CURRENT_TIMESTAMP"
+      },
+      "id": "node-upsert-proceso",
+      "name": "💾 Upsert proceso",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [1120, 300],
+      "credentials": { "mySql": { "id": "mysql-credential", "name": "MySQL Railway" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Recuperar KPIs guardados en el nodo de transformación\nconst kpisJson = $execution.customData.get('kpis');\nconst kpis = JSON.parse(kpisJson || '[]');\nconsole.log(`KPIs a sincronizar: ${kpis.length}`);\nreturn kpis.map(k => ({ json: k }));"
+      },
+      "id": "node-prep-kpis",
+      "name": "📋 Preparar KPIs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO kpis (proceso_id, orden, nombre, meta, actual, semaforo, frecuencia_med)\nVALUES (\n  {{ $json.proceso_id }},\n  {{ $json.orden }},\n  {{ $json.nombre }},\n  {{ $json.meta }},\n  {{ $json.actual }},\n  {{ $json.semaforo }},\n  {{ $json.frecuencia_med }}\n)\nON DUPLICATE KEY UPDATE\n  nombre         = VALUES(nombre),\n  meta           = VALUES(meta),\n  actual         = VALUES(actual),\n  semaforo       = VALUES(semaforo),\n  frecuencia_med = VALUES(frecuencia_med),\n  updated_at     = CURRENT_TIMESTAMP"
+      },
+      "id": "node-upsert-kpi",
+      "name": "💾 Upsert KPIs",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [1560, 300],
+      "credentials": { "mySql": { "id": "mysql-credential", "name": "MySQL Railway" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const procesados = $('node-upsert-proceso').all().length;\nconst kpisUpserted = $('node-upsert-kpi').all().length;\nconst now = new Date().toLocaleString('es-ES', { timeZone: 'America/La_Paz' });\nconsole.log(`\\n✅ Sincronización completada [${now}]`);\nconsole.log(`   Procesos: ${procesados}`);\nconsole.log(`   KPIs:     ${kpisUpserted}`);\nreturn [{ json: { status: 'ok', procesados, kpisUpserted, timestamp: now } }];"
+      },
+      "id": "node-log",
+      "name": "✅ Log final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first();\nconsole.error('❌ Error en sincronización:', JSON.stringify(error.json, null, 2));\n// Aquí podés agregar un nodo de notificación (Slack, email, Teams)\nreturn [{ json: { status: 'error', details: error.json } }];"
+      },
+      "id": "node-error",
+      "name": "❌ Manejo de error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 500]
+    }
+  ],
+  "connections": {
+    "⏰ Cada 6 horas": {
+      "main": [[{ "node": "📥 Descargar Excel de OneDrive", "type": "main", "index": 0 }]]
+    },
+    "📥 Descargar Excel de OneDrive": {
+      "main": [[{ "node": "📊 Leer hoja TABLA MAESTRA", "type": "main", "index": 0 }]]
+    },
+    "📊 Leer hoja TABLA MAESTRA": {
+      "main": [[{ "node": "🔄 Transformar datos", "type": "main", "index": 0 }]]
+    },
+    "🔄 Transformar datos": {
+      "main": [[{ "node": "💾 Upsert proceso", "type": "main", "index": 0 }]]
+    },
+    "💾 Upsert proceso": {
+      "main": [[{ "node": "📋 Preparar KPIs", "type": "main", "index": 0 }]]
+    },
+    "📋 Preparar KPIs": {
+      "main": [[{ "node": "💾 Upsert KPIs", "type": "main", "index": 0 }]]
+    },
+    "💾 Upsert KPIs": {
+      "main": [[{ "node": "✅ Log final", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "node-error"
+  },
+  "staticData": null,
+  "tags": ["procesos", "mysql", "onedrive", "sincronizacion"],
+  "meta": {
+    "notes": "CONFIGURACIÓN REQUERIDA:\n1. Credencial OAuth2 Microsoft 365 → Nodo 'Descargar Excel de OneDrive'\n   - Scopes necesarios: Files.Read, Files.ReadAll\n   - App registration en Azure AD\n2. Variable n8n ONEDRIVE_FILE_PATH → ruta relativa al Excel en OneDrive\n   Ejemplo: Documentos/Procesos/Tabla_Maestra_Procesos.xlsx\n3. Credencial MySQL → Nodos 'Upsert proceso' y 'Upsert KPIs'\n   - Host/puerto/user/pass de la BD Railway\n4. Ejecutar schema.sql en la BD antes de la primera sincronización\n5. Probar manualmente con el botón 'Test workflow' antes de activar el schedule"
+  }
+}
