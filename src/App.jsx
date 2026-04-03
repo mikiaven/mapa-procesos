@@ -1,4 +1,4 @@
-import { useState, useEffect, createContext, useContext } from 'react'
+import { useState, useEffect, createContext, useContext, useRef } from 'react'
 import { api } from './api.js'
 
 // ─── THEME SYSTEM ─────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ export default function App() {
           </div>
 
           <nav style={{display:'flex',gap:2}}>
-            {[{id:'map',l:'Mapa',i:'⬡'},{id:'risk',l:'Riesgo & Costo',i:'◈'},{id:'kpis',l:'KPIs',i:'◉'},{id:'flow',l:'Flujo',i:'⇢'},{id:'approval',l:'Aprobaciones',i:'✓'}].map(v=>(
+            {[{id:'map',l:'Mapa',i:'⬡'},{id:'risk',l:'Riesgo & Costo',i:'◈'},{id:'kpis',l:'KPIs',i:'◉'},{id:'flow',l:'Flujo',i:'⇢'},{id:'approval',l:'Aprobaciones',i:'✓'},{id:'canvas',l:'Lienzo',i:'⬦'}].map(v=>(
               <button key={v.id} onClick={()=>setView(v.id)} style={{padding:'6px 14px',borderRadius:6,border:'none',cursor:'pointer',fontSize:12,fontWeight:600,letterSpacing:'.04em',transition:'all .18s',background:view===v.id?theme.btnActive():'transparent',color:view===v.id?'#3b82f6':theme.textDim,borderBottom:view===v.id?'2px solid #3b82f6':'2px solid transparent',outline:'none'}}>
                 <span style={{marginRight:4}}>{v.i}</span>{v.l}
               </button>
@@ -233,6 +233,7 @@ export default function App() {
               {view==='kpis'     && <KPIView      processes={filtered} onSelect={openDetail}/>}
               {view==='flow'     && <FlowView     processes={filtered} allProcesses={processes} onSelect={openDetail}/>}
               {view==='approval' && <ApprovalView processes={filtered} allProcesses={processes} onSelect={openDetail}/>}
+              {view==='canvas'   && <CanvasView   processes={filtered} allProcesses={processes} onSelect={openDetail}/>}
             </div>
           )}
         </main>
@@ -532,6 +533,222 @@ function ApprovalView({processes,allProcesses,onSelect}) {
           </div>
         </Card>
       )}
+    </div>
+  )
+}
+
+// ─── CANVAS VIEW ──────────────────────────────────────────────────────────────
+function CanvasView({processes,allProcesses,onSelect}) {
+  const t=useT()
+  const svgRef=useRef(null)
+  const containerRef=useRef(null)
+
+  // ── layout: assign initial positions by type lane ──────────────────────────
+  function buildInitialPositions(procs) {
+    const W=200,H=90,GAP_X=240,GAP_Y=120
+    const lanes={strategic:[],operational:[],support:[]}
+    procs.forEach(p=>{ const k=p.type==='strategic'?'strategic':p.type==='operational'?'operational':'support'; lanes[k].push(p) })
+    const pos={}
+    const laneY={strategic:60,operational:60+H+GAP_Y,support:60+(H+GAP_Y)*2}
+    Object.entries(lanes).forEach(([lane,arr])=>{
+      arr.forEach((p,i)=>{ pos[p.id]={x:60+i*(W+GAP_X),y:laneY[lane],w:W,h:H} })
+    })
+    return pos
+  }
+
+  const [positions,setPositions]=useState(()=>buildInitialPositions(processes))
+  const [pan,setPan]=useState({x:0,y:0})
+  const [zoom,setZoom]=useState(1)
+  const dragging=useRef(null)
+  const lastMouse=useRef(null)
+  const isPanning=useRef(false)
+
+  // sync positions when processes change (new filter)
+  useEffect(()=>{
+    setPositions(prev=>{
+      const next=buildInitialPositions(processes)
+      // keep user-moved positions
+      processes.forEach(p=>{ if(prev[p.id]) next[p.id]=prev[p.id] })
+      return next
+    })
+  },[processes])
+
+  // ── drag node ────────────────────────────────────────────────────────────────
+  function onNodeMouseDown(e,id) {
+    e.stopPropagation()
+    dragging.current={id,startX:e.clientX,startY:e.clientY,origX:positions[id]?.x||0,origY:positions[id]?.y||0}
+    window.addEventListener('mousemove',onMouseMove)
+    window.addEventListener('mouseup',onMouseUp)
+  }
+
+  // ── pan canvas ───────────────────────────────────────────────────────────────
+  function onCanvasMouseDown(e) {
+    if(e.button!==0) return
+    isPanning.current=true
+    lastMouse.current={x:e.clientX,y:e.clientY}
+    window.addEventListener('mousemove',onMouseMove)
+    window.addEventListener('mouseup',onMouseUp)
+  }
+
+  function onMouseMove(e) {
+    if(dragging.current) {
+      const dx=(e.clientX-dragging.current.startX)/zoom
+      const dy=(e.clientY-dragging.current.startY)/zoom
+      setPositions(prev=>({...prev,[dragging.current.id]:{...prev[dragging.current.id],x:dragging.current.origX+dx,y:dragging.current.origY+dy}}))
+    } else if(isPanning.current && lastMouse.current) {
+      const dx=e.clientX-lastMouse.current.x
+      const dy=e.clientY-lastMouse.current.y
+      setPan(p=>({x:p.x+dx,y:p.y+dy}))
+      lastMouse.current={x:e.clientX,y:e.clientY}
+    }
+  }
+
+  function onMouseUp() {
+    dragging.current=null
+    isPanning.current=false
+    lastMouse.current=null
+    window.removeEventListener('mousemove',onMouseMove)
+    window.removeEventListener('mouseup',onMouseUp)
+  }
+
+  // ── zoom wheel ───────────────────────────────────────────────────────────────
+  function onWheel(e) {
+    e.preventDefault()
+    const delta=e.deltaY>0?0.9:1.1
+    setZoom(z=>Math.max(0.3,Math.min(2.5,z*delta)))
+  }
+
+  // ── reset ────────────────────────────────────────────────────────────────────
+  function reset() {
+    setPositions(buildInitialPositions(processes))
+    setPan({x:0,y:0})
+    setZoom(1)
+  }
+
+  // ── compute edges (successors) ───────────────────────────────────────────────
+  const edges=[]
+  processes.forEach(p=>{
+    (p.successors||[]).forEach(sid=>{
+      if(positions[p.id] && positions[sid]) edges.push({from:p.id,to:sid})
+    })
+  })
+
+  // ── bezier path between two nodes ────────────────────────────────────────────
+  function edgePath(fromId,toId) {
+    const a=positions[fromId],b=positions[toId]
+    if(!a||!b) return ''
+    const x1=a.x+(a.w||200),y1=a.y+(a.h||90)/2
+    const x2=b.x,y2=b.y+(b.h||90)/2
+    const cx=(x1+x2)/2
+    return `M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}`
+  }
+
+  // canvas size: fit all nodes + padding
+  const allX=Object.values(positions).map(p=>p.x+(p.w||200))
+  const allY=Object.values(positions).map(p=>p.y+(p.h||90))
+  const canvasW=Math.max(1200,allX.length?Math.max(...allX)+80:1200)
+  const canvasH=Math.max(700,allY.length?Math.max(...allY)+80:700)
+
+  return (
+    <div style={{position:'relative',userSelect:'none'}}>
+      {/* toolbar */}
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
+        <div style={{fontSize:13,fontWeight:700,color:t.textBright,letterSpacing:'.04em'}}>⬦ Lienzo de Procesos</div>
+        <div style={{flex:1}}/>
+        <div style={{fontSize:11,color:t.textDim}}>Arrastra nodos · Scroll para zoom · Arrastra fondo para mover</div>
+        <button onClick={reset} style={{padding:'5px 14px',borderRadius:6,border:`1px solid ${t.inputBorder}`,background:t.statBg,color:t.textMuted,cursor:'pointer',fontSize:11,fontWeight:600,outline:'none'}}>↺ Resetear vista</button>
+        <div style={{fontSize:11,color:t.textDim,padding:'4px 10px',borderRadius:6,background:t.statBg,border:`1px solid ${t.statBorder}`}}>{Math.round(zoom*100)}%</div>
+      </div>
+
+      {/* legend */}
+      <div style={{display:'flex',gap:12,marginBottom:10,flexWrap:'wrap'}}>
+        {[['strategic','◆ Estratégico','#3b82f6'],['operational','⬡ Operacional',t.type?.operational?.accent||'#4ade80'],['support','● Complementario',t.type?.support?.accent||'#fbbf24']].map(([,label,color])=>(
+          <div key={label} style={{display:'flex',alignItems:'center',gap:5,fontSize:10,color:t.textDim}}>
+            <div style={{width:10,height:10,borderRadius:3,background:color,opacity:.85}}/>
+            {label}
+          </div>
+        ))}
+        <div style={{display:'flex',alignItems:'center',gap:5,fontSize:10,color:t.textDim}}>
+          <svg width="22" height="10"><path d="M0,5 C8,5 14,5 22,5" stroke={t.textDim} strokeWidth="1.5" fill="none" markerEnd="url(#arrowLegend)"/></svg>
+          Sucesor
+        </div>
+      </div>
+
+      {/* canvas */}
+      <div
+        ref={containerRef}
+        onMouseDown={onCanvasMouseDown}
+        onWheel={onWheel}
+        style={{overflow:'hidden',borderRadius:12,border:`1px solid ${t.surfaceBorder}`,background:t.surfaceBg,cursor:'grab',height:'68vh',position:'relative'}}
+      >
+        <div style={{transform:`translate(${pan.x}px,${pan.y}px) scale(${zoom})`,transformOrigin:'0 0',width:canvasW,height:canvasH,position:'relative'}}>
+          {/* dot grid */}
+          <svg width={canvasW} height={canvasH} style={{position:'absolute',top:0,left:0,pointerEvents:'none'}}>
+            <defs>
+              <pattern id="dotgrid" x="0" y="0" width="30" height="30" patternUnits="userSpaceOnUse">
+                <circle cx="1" cy="1" r="1" fill={t.textDim} opacity=".22"/>
+              </pattern>
+              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L8,3 z" fill={t.textDim} opacity=".7"/>
+              </marker>
+              <marker id="arrowLegend" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L6,3 z" fill={t.textDim} opacity=".7"/>
+              </marker>
+            </defs>
+            <rect width={canvasW} height={canvasH} fill="url(#dotgrid)"/>
+            {/* edges */}
+            {edges.map((e,i)=>(
+              <path key={i} d={edgePath(e.from,e.to)} stroke={t.textDim} strokeWidth="1.6" fill="none" strokeDasharray="6 3" markerEnd="url(#arrow)" opacity=".65"/>
+            ))}
+          </svg>
+
+          {/* nodes */}
+          {processes.map(p=>{
+            const pos=positions[p.id]
+            if(!pos) return null
+            const cfg=t.type?.[p.type==='strategic'?'strategic':p.type==='operational'?'operational':'support']||{}
+            const rc=RISK_COLOR[p.risk]||'#64748b'
+            const apvIcon=APPROVAL[p.approval]?.icon||''
+            return (
+              <div
+                key={p.id}
+                onMouseDown={e=>onNodeMouseDown(e,p.id)}
+                onDoubleClick={()=>onSelect&&onSelect(p)}
+                style={{
+                  position:'absolute',
+                  left:pos.x,top:pos.y,width:pos.w||200,height:pos.h||90,
+                  background:cfg.bg||t.surfaceBg,
+                  border:`2px solid ${cfg.border||t.surfaceBorder}`,
+                  borderRadius:10,
+                  cursor:'grab',
+                  padding:'10px 13px',
+                  boxShadow:`0 2px 12px ${cfg.accent||'#3b82f6'}22`,
+                  display:'flex',flexDirection:'column',gap:4,
+                  transition:'box-shadow .15s',
+                  overflow:'hidden',
+                }}
+              >
+                <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:2}}>
+                  <span style={{fontSize:13,color:cfg.accent||'#3b82f6'}}>{TYPE_ICON[p.type]||'⬡'}</span>
+                  <span style={{fontSize:10,fontWeight:700,color:cfg.accent||t.textBright,flex:1,overflow:'hidden',whiteSpace:'nowrap',textOverflow:'ellipsis'}}>{p.name}</span>
+                </div>
+                <div style={{display:'flex',gap:5,alignItems:'center',flexWrap:'wrap'}}>
+                  <span style={{fontSize:8,padding:'1px 6px',borderRadius:8,background:`${rc}18`,color:rc,border:`1px solid ${rc}40`,fontWeight:600}}>{p.risk||'—'}</span>
+                  <span style={{fontSize:8,padding:'1px 6px',borderRadius:8,background:`${cfg.accent||'#3b82f6'}18`,color:cfg.accent||t.textMuted,border:`1px solid ${cfg.accent||'#3b82f6'}30`,fontWeight:600}}>{TYPE_LABEL[p.type]||p.type}</span>
+                </div>
+                <div style={{display:'flex',gap:4,alignItems:'center',marginTop:'auto'}}>
+                  <span style={{fontSize:9,color:t.textFaint}}>{apvIcon} {p.approval}</span>
+                  {(p.successors||[]).length>0 && <span style={{marginLeft:'auto',fontSize:8,color:t.textDim}}>→ {p.successors.length}</span>}
+                </div>
+                <div style={{fontSize:8,color:t.textDim,position:'absolute',bottom:3,right:6,opacity:.5,cursor:'default'}} title="Doble clic para abrir detalle">⊞</div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+      <div style={{marginTop:7,fontSize:10,color:t.textFaint,textAlign:'right'}}>
+        Doble clic sobre un nodo para ver el detalle · {processes.length} procesos · {edges.length} conexiones
+      </div>
     </div>
   )
 }
